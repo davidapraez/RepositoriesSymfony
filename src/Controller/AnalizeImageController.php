@@ -22,7 +22,7 @@ class AnalizeImageController extends AbstractController
     public function analyzeImage(Request $request): Response {
         try {
             $url = $request->request->get('url');
-            $uploadedImage = null;
+            $uploadedImageUrl = null;
 
             // Initialize AWS S3 client
             $s3Client = new S3Client([
@@ -37,18 +37,16 @@ class AnalizeImageController extends AbstractController
             // Process URL or file upload
             if (!empty($url)) {
                 $this->validateUrl($url);
-                $uploadedImage = ['url' => $url];
+                $uploadedImageUrl = $url;
             } else {
-                $uploadedImage = $this->uploadImageAndGetUrl($request, $s3Client);
+                $uploadedImageUrl = $this->uploadImageAndGetUrl($request, $s3Client);
             }
 
             // Send image to Lambda for processing
-            $lambdaResponse = $this->sendToLambda($uploadedImage['url']);
+            $lambdaResponse = $this->sendToLambda($uploadedImageUrl);
 
             // Delete the uploaded image from S3 if it was uploaded
-            if (!$url) {
-                $this->deleteImageFromS3($s3Client, $uploadedImage['key']);
-            }
+            $this->deleteImageFromS3($request, $s3Client);
 
             // Return the Lambda response
             return new JsonResponse([
@@ -79,17 +77,16 @@ class AnalizeImageController extends AbstractController
      * @return string
      * @throws \Exception if no image is provided
      */
-    private function uploadImageAndGetUrl(Request $request, S3Client $s3Client): array {
+    private function uploadImageAndGetUrl(Request $request, S3Client $s3Client) {
         $imageFile = $request->files->get('image');
         if ($imageFile) {
             $key = 'assets/imageCampaignTester/' . uniqid() . '_' . $imageFile->getClientOriginalName();
-            $s3Client->putObject([
+            $result = $s3Client->putObject([
                 'Bucket'     => $_ENV['AWS_BUCKET'],
                 'Key'        => $key,
                 'SourceFile' => $imageFile->getPathname(),
             ]);
-            $objectUrl = $s3Client->getObjectUrl($_ENV['AWS_BUCKET'], $key);
-            return ['url' => $objectUrl, 'key' => $key];
+            return $result->get('ObjectURL');
         }
 
         throw new \Exception("No image data provided");
@@ -101,11 +98,13 @@ class AnalizeImageController extends AbstractController
      * @param Request $request
      * @param S3Client $s3Client
      */
-    private function deleteImageFromS3(S3Client $s3Client, string $key) {
-        $s3Client->deleteObject([
-            'Bucket' => $_ENV['AWS_BUCKET'],
-            'Key'    => $key,
-        ]);
+    private function deleteImageFromS3(Request $request, S3Client $s3Client) {
+        if ($request->files->get('image')) {
+            $s3Client->deleteObject([
+                'Bucket' => $_ENV['AWS_BUCKET'],
+                'Key'    => 'assets/imageCampaignTester/' . uniqid() . '_' . $request->files->get('image')->getClientOriginalName(),
+            ]);
+        }
     }
 
     /**

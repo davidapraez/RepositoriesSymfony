@@ -2,10 +2,10 @@
 
 namespace App\Controller;
 
-use Aws\S3\Exception\S3Exception;
 use Aws\S3\S3Client;
 use FFMpeg\Coordinate\TimeCode;
 use FFMpeg\FFMpeg;
+use FFMpeg\Format\Audio\Mp3;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -25,12 +25,8 @@ class AnalizeVideoController extends AbstractController
     #[Route('/analyzeVideo', name: 'analize_video')]
     public function analizeVideo(Request $request): Response {
         $videoFile = $request->files->get('video');
-        $videoFile = $request->files->get('video');
-if (!$videoFile) {
-    return new JsonResponse(['error' => 'No video file uploaded'], Response::HTTP_BAD_REQUEST);
-}
-
-        $responses = [];
+        $imageResponses = [];
+        $audioResponse = [];
 
         if ($videoFile) {
             $ffmpeg = FFMpeg::create();
@@ -39,26 +35,27 @@ if (!$videoFile) {
 
             if ($duration > 120) {
                 return new JsonResponse(['error' => 'Video duration exceeds 2 minutes'], Response::HTTP_BAD_REQUEST);
-            }  
-
-            $s3Client = $this->initializeS3Client();
-
-            for ($i = 1; $i <= $duration; $i++) {
-                $uploadResult = $this->extractAndUploadFrame($s3Client, $video, $i);
-                $responses[] = $this->sendToGoogleVisionApi($uploadResult['url']);
-    
-                // Eliminar la imagen de S3 después del análisis
-                $this->deleteImageFromS3($s3Client, $_ENV['AWS_BUCKET'], $uploadResult['key']);
             }
-
-            $responseData = ['data' => $responses];
+            $s3Client = $this->initializeS3Client();
+            $audioPath = $this->extractAudioFromVideo($videoFile);
+            $audioUrl = $this->uploadAudioToS3($s3Client, $audioPath);
+            $audioResponse = $this->sendAudioToTranscriptionApi($audioUrl);
+            for ($i = 1; $i <= $duration; $i++) {
+                $frameUrl = $this->extractAndUploadFrame($s3Client, $video, $i);
+                $imageResponses[] = $this->sendToGoogleVisionApi($frameUrl);
+            }
+        
+        $responseData = [
+            'images' => $imageResponses,
+            'audio' => $audioResponse
+        ];
         } else {
             $responseData = ['error' => 'No video file uploaded'];
         }
 
         return new JsonResponse($responseData);
     }
-
+    //Image Analize
     /**
      * Initializes and returns an S3 client.
      * 
@@ -98,27 +95,7 @@ if (!$videoFile) {
 
         $bucket = $_ENV['AWS_BUCKET'];
         $region = $_ENV['AWS_DEFAULT_REGION'];
-        $frameUrl = "https://{$bucket}.s3.{$region}.amazonaws.com/{$key}";
-
-        return ['url' => $frameUrl, 'key' => $key];
-    }
-
-    private function deleteImageFromS3($s3Client, $bucket, $key) {
-        try {
-            $s3Client->deleteObject([
-                'Bucket' => $bucket,
-                'Key'    => $key
-            ]);
-        } catch (S3Exception $e) {
-            // Log the error message for future reference
-            $errorMessage = sprintf(
-                'Error deleting object from S3. Bucket: %s, Key: %s. Error message: %s',
-                $bucket,
-                $key,
-                $e->getMessage()
-            );
-            error_log($errorMessage);
-        }
+        return "https://{$bucket}.s3.{$region}.amazonaws.com/{$key}";
     }
 
     /**
@@ -150,5 +127,64 @@ if (!$videoFile) {
         curl_close($ch);
         return json_decode($response, true);
     }
+
+    //Audio Analize
+    private function extractAudioFromVideo($videoFile) {
+        $ffmpeg = FFMpeg::create();
+        $video = $ffmpeg->open($videoFile->getPathname());
+        $audioPath = sys_get_temp_dir() . "/audio.mp3";
+    
+        // Utiliza la clase Mp3 directamente sin el prefijo FFMpeg\FFMpeg
+        $audio_format = new Mp3();
+    
+        $video->save($audio_format, $audioPath);
+    
+        return $audioPath;
+    }
+    
+    
+    private function uploadAudioToS3($s3Client, $audioPath) {
+        $key = 'assets/audio/' . basename($audioPath);
+        $s3Client->putObject([
+            'Bucket'     => $_ENV['AWS_BUCKET'],
+            'Key'        => $key,
+            'SourceFile' => $audioPath,
+        ]);
+        unlink($audioPath); // Eliminar el archivo temporal
+    
+        $bucket = $_ENV['AWS_BUCKET'];
+        $region = $_ENV['AWS_DEFAULT_REGION'];
+        return "https://{$bucket}.s3.{$region}.amazonaws.com/{$key}";
+    }
+    /**
+ * Sends an audio URL to the transcription API and returns the response.
+ * 
+ * @param string $audioUrl
+ * @return array|bool Response from the transcription API or error
+ */
+private function sendAudioToTranscriptionApi($audioUrl) {
+    $ch = curl_init();
+    $data = json_encode(['audioUrl' => $audioUrl]);
+
+    // Reemplaza esta URL con la URL de tu API Node.js
+    curl_setopt($ch, CURLOPT_URL, 'http://localhost:3001/transcribe');
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'Content-Length: ' . strlen($data)
+    ]);
+
+    $response = curl_exec($ch);
+    if ($response === false) {
+        $error = curl_error($ch);
+        curl_close($ch);
+        return ['error' => $error];
+    }
+
+    curl_close($ch);
+    return json_decode($response, true);
+}
 }
 
