@@ -25,36 +25,38 @@ class AnalizeVideoController extends AbstractController
     #[Route('/analyzeVideo', name: 'analize_video')]
     public function analizeVideo(Request $request): Response {
         $videoFile = $request->files->get('video');
-        if (!$videoFile) {
-            return $this->json(['error' => 'No video file uploaded'], JsonResponse::HTTP_BAD_REQUEST);
-        }
-        $authUser = $this->getUser();
-        $authUserId = $authUser->getId();
+        $videoFile = $request->files->get('video');
+if (!$videoFile) {
+    return new JsonResponse(['error' => 'No video file uploaded'], Response::HTTP_BAD_REQUEST);
+}
 
-        $ffmpeg = FFMpeg::create();
-        $video = $ffmpeg->open($videoFile->getRealPath());
-        $duration = $video->getFFProbe()->format($videoFile->getRealPath())->get('duration');
+        $responses = [];
 
-        if ($duration > 120) {
-            return $this->json(['error' => 'Video duration exceeds 2 minutes'], JsonResponse::HTTP_BAD_REQUEST);
-        }  
+        if ($videoFile) {
+            $ffmpeg = FFMpeg::create();
+            $video = $ffmpeg->open($videoFile);
+            $duration = $video->getFFProbe()->format($videoFile)->get('duration');
 
-        $s3Client = $this->initializeS3Client();
-        $responses = []; 
-        $region = $_ENV['AWS_DEFAULT_REGION'];
-        $bucket = $_ENV['AWS_BUCKET'];
-        for ($i = 1; $i <= $duration; $i++) {
-            try {
-                $key = $this->extractAndUploadFrame($s3Client, $video, $i, $authUserId);
-                $frameUrl = "https://{$bucket}.s3.{$region}.amazonaws.com/{$key}";
-                $responses[] = $this->sendToGoogleVisionApi($frameUrl);
-                $this->deleteImageFromS3($s3Client, $bucket, $key);
-            } catch (\Exception $e) {
-                return $this->json(['error' => 'An error occurred while processing the video: ' . $e->getMessage()], JsonResponse::HTTP_INTERNAL_SERVER_ERROR);
+            if ($duration > 120) {
+                return new JsonResponse(['error' => 'Video duration exceeds 2 minutes'], Response::HTTP_BAD_REQUEST);
+            }  
+
+            $s3Client = $this->initializeS3Client();
+
+            for ($i = 1; $i <= $duration; $i++) {
+                $uploadResult = $this->extractAndUploadFrame($s3Client, $video, $i);
+                $responses[] = $this->sendToGoogleVisionApi($uploadResult['url']);
+    
+                // Eliminar la imagen de S3 después del análisis
+                $this->deleteImageFromS3($s3Client, $_ENV['AWS_BUCKET'], $uploadResult['key']);
             }
+
+            $responseData = ['data' => $responses];
+        } else {
+            $responseData = ['error' => 'No video file uploaded'];
         }
 
-        return $this->json(['data' => $responses]);
+        return new JsonResponse($responseData);
     }
 
     /**
@@ -81,25 +83,24 @@ class AnalizeVideoController extends AbstractController
      * @param int $second
      * @return string URL of the uploaded frame
      */
-    private function extractAndUploadFrame($s3Client, $video, $second, $userId): string {
+    private function extractAndUploadFrame($s3Client, $video, $second) {
         $timecode = TimeCode::fromSeconds($second);
         $framePath = sys_get_temp_dir() . "/frame_$second.jpg";
         $video->frame($timecode)->save($framePath);
 
-        $key = 'assets/imageVideoCampaignTester/' . $userId . '/' . $second . '.jpg';
-        try {
-            $s3Client->putObject([
-                'Bucket'     => $_ENV['AWS_BUCKET'],
-                'Key'        => $key,
-                'SourceFile' => $framePath,
-            ]);
-        } catch (S3Exception $e) {
-            throw new \Exception("Error uploading frame to S3: " . $e->getMessage());
-        } finally {
-            unlink($framePath);
-        }
+        $key = 'assets/imageVideoCampaignTester/' . $second . '.jpg';
+        $s3Client->putObject([
+            'Bucket'     => $_ENV['AWS_BUCKET'],
+            'Key'        => $key,
+            'SourceFile' => $framePath,
+        ]);
+        unlink($framePath); // Delete the temporary file
 
-        return $key;
+        $bucket = $_ENV['AWS_BUCKET'];
+        $region = $_ENV['AWS_DEFAULT_REGION'];
+        $frameUrl = "https://{$bucket}.s3.{$region}.amazonaws.com/{$key}";
+
+        return ['url' => $frameUrl, 'key' => $key];
     }
 
     private function deleteImageFromS3($s3Client, $bucket, $key) {
@@ -109,8 +110,14 @@ class AnalizeVideoController extends AbstractController
                 'Key'    => $key
             ]);
         } catch (S3Exception $e) {
-            // Manejar la excepción si es necesario
-            echo "There was an error deleting the file: " . $e->getMessage();
+            // Log the error message for future reference
+            $errorMessage = sprintf(
+                'Error deleting object from S3. Bucket: %s, Key: %s. Error message: %s',
+                $bucket,
+                $key,
+                $e->getMessage()
+            );
+            error_log($errorMessage);
         }
     }
 
@@ -120,7 +127,7 @@ class AnalizeVideoController extends AbstractController
      * @param string $frameUrl
      * @return array|bool Response from Google Vision API or error
      */
-    private function sendToGoogleVisionApi($frameUrl): array {
+    private function sendToGoogleVisionApi($frameUrl) {
         $ch = curl_init();
         $data = json_encode(['url' => $frameUrl]);
 
@@ -137,7 +144,7 @@ class AnalizeVideoController extends AbstractController
         if ($response === false) {
             $error = curl_error($ch);
             curl_close($ch);
-            return ['error' => 'Error connecting to Google Vision API: ' . $error];
+            return ['error' => $error];
         }
 
         curl_close($ch);
