@@ -13,7 +13,9 @@ use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Routing\Annotation\Route;
 
 class AnalizeVideoController extends AbstractController
-{
+{   
+    private const MAX_RETRIES = 3; // Número máximo de reintentos
+    private const RETRY_DELAY = 5; //
     /**
      * Analyzes a video by extracting frames and processing them.
      * 
@@ -26,37 +28,40 @@ class AnalizeVideoController extends AbstractController
     public function analizeVideo(Request $request): Response {
         $videoFile = $request->files->get('video');
         $videoFile = $request->files->get('video');
-if (!$videoFile) {
-    return new JsonResponse(['error' => 'No video file uploaded'], Response::HTTP_BAD_REQUEST);
+        if (!$videoFile) {
+            return $this->jsonResponseError('No video file uploaded');
+        }
+        $ffmpeg = FFMpeg::create();
+        $video = $ffmpeg->open($videoFile);
+        $duration = $video->getFFProbe()->format($videoFile)->get('duration');
+        if ($duration > 120) {
+            return $this->jsonResponseError('Video duration exceeds 2 minutes');
+        }
+        $s3Client = $this->initializeS3Client();
+        $responses = [];
+        $keysToDelete = [];
+
+        for ($i = 1; $i <= $duration; $i++) {
+            $uploadResult = $this->extractAndUploadFrame($s3Client, $video, $i);
+            $response = $this->retrySendingToGoogleVisionApi($uploadResult['url']);
+
+            if (!isset($response['error'])) {
+                $responses[] = $response;
+                $keysToDelete[] = $uploadResult['key'];
+            } else {
+                error_log('Error after retries: ' . $response['error']);
+            }
 }
 
-        $responses = [];
+foreach ($keysToDelete as $key) {
+    $this->deleteImageFromS3($s3Client, $_ENV['AWS_BUCKET'], $key);
+}
 
-        if ($videoFile) {
-            $ffmpeg = FFMpeg::create();
-            $video = $ffmpeg->open($videoFile);
-            $duration = $video->getFFProbe()->format($videoFile)->get('duration');
+return new JsonResponse(['data' => $responses]);
+    }
 
-            if ($duration > 120) {
-                return new JsonResponse(['error' => 'Video duration exceeds 2 minutes'], Response::HTTP_BAD_REQUEST);
-            }  
-
-            $s3Client = $this->initializeS3Client();
-
-            for ($i = 1; $i <= $duration; $i++) {
-                $uploadResult = $this->extractAndUploadFrame($s3Client, $video, $i);
-                $responses[] = $this->sendToGoogleVisionApi($uploadResult['url']);
-    
-                // Eliminar la imagen de S3 después del análisis
-                $this->deleteImageFromS3($s3Client, $_ENV['AWS_BUCKET'], $uploadResult['key']);
-            }
-
-            $responseData = ['data' => $responses];
-        } else {
-            $responseData = ['error' => 'No video file uploaded'];
-        }
-
-        return new JsonResponse($responseData);
+    private function jsonResponseError($message, $statusCode = Response::HTTP_BAD_REQUEST) {
+        return new JsonResponse(['error' => $message], $statusCode);
     }
 
     /**
@@ -119,6 +124,28 @@ if (!$videoFile) {
             );
             error_log($errorMessage);
         }
+    }
+     /**
+     * Reintentar enviar una imagen a la API de Google Vision.
+     * 
+     * @param string $frameUrl
+     * @return array
+     */
+    private function retrySendingToGoogleVisionApi($frameUrl) {
+        $attempt = 0;
+
+        while ($attempt < self::MAX_RETRIES) {
+            $response = $this->sendToGoogleVisionApi($frameUrl);
+
+            if (!isset($response['error'])) {
+                return $response;
+            }
+
+            $attempt++;
+            sleep(self::RETRY_DELAY);
+        }
+
+        return ['error' => 'Failed after ' . self::MAX_RETRIES . ' retries'];
     }
 
     /**
